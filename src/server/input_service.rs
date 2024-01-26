@@ -1,22 +1,31 @@
 use super::*;
 #[cfg(target_os = "macos")]
 use crate::common::is_server;
-#[cfg(target_os = "linux")]
-use crate::common::IS_X11;
+use crate::input::*;
 #[cfg(target_os = "macos")]
 use dispatch::Queue;
 use enigo::{Enigo, Key, KeyboardControllable, MouseButton, MouseControllable};
-use hbb_common::{config::COMPRESS_LEVEL, get_time, protobuf::EnumOrUnknown};
+#[cfg(target_os = "linux")]
+use super::rdp_input::client::{RdpInputKeyboard, RdpInputMouse};
+use hbb_common::{
+    get_time,
+    message_proto::{pointer_device_event::Union::TouchEvent, touch_event::Union::ScaleUpdate},
+    protobuf::EnumOrUnknown,
+};
 use rdev::{self, EventType, Key as RdevKey, KeyCode, RawKey};
 #[cfg(target_os = "macos")]
 use rdev::{CGEventSourceStateID, CGEventTapLocation, VirtualInput};
+#[cfg(target_os = "linux")]
+use scrap::wayland::pipewire::RDP_RESPONSE;
 use std::{
     convert::TryFrom,
-    ops::Sub,
+    ops::{Deref, DerefMut, Sub},
     sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{self, Duration, Instant},
 };
+#[cfg(windows)]
+use winapi::um::winuser::WHEEL_DELTA;
 
 const INVALID_CURSOR_POS: i32 = i32::MIN;
 
@@ -229,18 +238,43 @@ fn should_disable_numlock(evt: &KeyEvent) -> bool {
 
 pub const NAME_CURSOR: &'static str = "mouse_cursor";
 pub const NAME_POS: &'static str = "mouse_pos";
-pub type MouseCursorService = ServiceTmpl<MouseCursorSub>;
+#[derive(Clone)]
+pub struct MouseCursorService {
+    pub sp: ServiceTmpl<MouseCursorSub>,
+}
 
-pub fn new_cursor() -> MouseCursorService {
-    let sp = MouseCursorService::new(NAME_CURSOR, true);
-    sp.repeat::<StateCursor, _>(33, run_cursor);
-    sp
+impl Deref for MouseCursorService {
+    type Target = ServiceTmpl<MouseCursorSub>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.sp
+    }
+}
+
+impl DerefMut for MouseCursorService {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.sp
+    }
+}
+
+impl MouseCursorService {
+    pub fn new(name: String, need_snapshot: bool) -> Self {
+        Self {
+            sp: ServiceTmpl::<MouseCursorSub>::new(name, need_snapshot),
+        }
+    }
+}
+
+pub fn new_cursor() -> ServiceTmpl<MouseCursorSub> {
+    let svc = MouseCursorService::new(NAME_CURSOR.to_owned(), true);
+    ServiceTmpl::<MouseCursorSub>::repeat::<StateCursor, _, _>(&svc.clone(), 33, run_cursor);
+    svc.sp
 }
 
 pub fn new_pos() -> GenericService {
-    let sp = GenericService::new(NAME_POS, false);
-    sp.repeat::<StatePos, _>(33, run_pos);
-    sp
+    let svc = EmptyExtraFieldService::new(NAME_POS.to_owned(), false);
+    GenericService::repeat::<StatePos, _, _>(&svc.clone(), 33, run_pos);
+    svc.sp
 }
 
 #[inline]
@@ -251,7 +285,7 @@ fn update_last_cursor_pos(x: i32, y: i32) {
     }
 }
 
-fn run_pos(sp: GenericService, state: &mut StatePos) -> ResultType<()> {
+fn run_pos(sp: EmptyExtraFieldService, state: &mut StatePos) -> ResultType<()> {
     let (_, (x, y)) = *LATEST_SYS_CURSOR_POS.lock().unwrap();
     if x == INVALID_CURSOR_POS || y == INVALID_CURSOR_POS {
         return Ok(());
@@ -299,8 +333,7 @@ fn run_cursor(sp: MouseCursorService, state: &mut StateCursor) -> ResultType<()>
                 msg = cached.clone();
             } else {
                 let mut data = crate::get_cursor_data(hcursor)?;
-                data.colors =
-                    hbb_common::compress::compress(&data.colors[..], COMPRESS_LEVEL).into();
+                data.colors = hbb_common::compress::compress(&data.colors[..]).into();
                 let mut tmp = Message::new();
                 tmp.set_cursor_data(data);
                 msg = Arc::new(tmp);
@@ -341,13 +374,13 @@ const MOUSE_ACTIVE_DISTANCE: i32 = 5;
 
 static RECORD_CURSOR_POS_RUNNING: AtomicBool = AtomicBool::new(false);
 
-pub fn try_start_record_cursor_pos() {
+pub fn try_start_record_cursor_pos() -> Option<thread::JoinHandle<()>> {
     if RECORD_CURSOR_POS_RUNNING.load(Ordering::SeqCst) {
-        return;
+        return None;
     }
 
     RECORD_CURSOR_POS_RUNNING.store(true, Ordering::SeqCst);
-    thread::spawn(|| {
+    let handle = thread::spawn(|| {
         let interval = time::Duration::from_millis(33);
         loop {
             if !RECORD_CURSOR_POS_RUNNING.load(Ordering::SeqCst) {
@@ -365,6 +398,7 @@ pub fn try_start_record_cursor_pos() {
         }
         update_last_cursor_pos(INVALID_CURSOR_POS, INVALID_CURSOR_POS);
     });
+    Some(handle)
 }
 
 pub fn try_stop_record_cursor_pos() {
@@ -428,6 +462,25 @@ pub async fn setup_uinput(minx: i32, maxx: i32, miny: i32, maxy: i32) -> ResultT
         .unwrap()
         .set_custom_keyboard(Box::new(keyboard));
     ENIGO.lock().unwrap().set_custom_mouse(Box::new(mouse));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub async fn setup_rdp_input() -> ResultType<(), Box<dyn std::error::Error>> {
+    let mut en = ENIGO.lock()?;
+    let rdp_res_lock = RDP_RESPONSE.lock()?;
+    let rdp_res = rdp_res_lock.as_ref().ok_or("RDP response is None")?;
+
+    let keyboard = RdpInputKeyboard::new(rdp_res.conn.clone(), rdp_res.session.clone())?;
+    en.set_custom_keyboard(Box::new(keyboard));
+    log::info!("RdpInput keyboard created");
+
+    if let Some(stream) = rdp_res.streams.clone().into_iter().next() {
+        let mouse = RdpInputMouse::new(rdp_res.conn.clone(), rdp_res.session.clone(), stream)?;
+        en.set_custom_mouse(Box::new(mouse));
+        log::info!("RdpInput mouse created");
+    }
+
     Ok(())
 }
 
@@ -506,26 +559,7 @@ fn get_modifier_state(key: Key, en: &mut Enigo) -> bool {
     }
 }
 
-#[inline]
-fn update_latest_peer_input_cursor(evt: &MouseEvent, conn: i32, is_checked_movement: bool) {
-    if is_checked_movement || evt.mask & 0x7 == 0 {
-        let time = get_time();
-        *LATEST_PEER_INPUT_CURSOR.lock().unwrap() = Input {
-            time,
-            conn,
-            x: evt.x,
-            y: evt.y,
-        };
-    }
-}
-
 pub fn handle_mouse(evt: &MouseEvent, conn: i32) {
-    if !active_mouse_(conn) {
-        return;
-    }
-    #[cfg(windows)]
-    update_latest_peer_input_cursor(evt, conn, false);
-
     #[cfg(target_os = "macos")]
     if !is_server() {
         // having GUI, run main GUI thread, otherwise crash
@@ -534,9 +568,24 @@ pub fn handle_mouse(evt: &MouseEvent, conn: i32) {
         return;
     }
     #[cfg(windows)]
-    crate::portable_service::client::handle_mouse(evt);
+    crate::portable_service::client::handle_mouse(evt, conn);
     #[cfg(not(windows))]
     handle_mouse_(evt, conn);
+}
+
+// to-do: merge handle_mouse and handle_pointer
+pub fn handle_pointer(evt: &PointerDeviceEvent, conn: i32) {
+    #[cfg(target_os = "macos")]
+    if !is_server() {
+        // having GUI, run main GUI thread, otherwise crash
+        let evt = evt.clone();
+        QUEUE.exec_async(move || handle_pointer_(&evt, conn));
+        return;
+    }
+    #[cfg(windows)]
+    crate::portable_service::client::handle_pointer(evt, conn);
+    #[cfg(not(windows))]
+    handle_pointer_(evt, conn);
 }
 
 pub fn fix_key_down_timeout_loop() {
@@ -689,13 +738,25 @@ fn fix_modifiers(modifiers: &[EnumOrUnknown<ControlKey>], en: &mut Enigo, ck: i3
     }
 }
 
+// Update time to avoid send cursor position event to the peer.
+// See `run_pos` --> `set_cursor_position` --> `exclude`
+#[inline]
+pub fn update_latest_input_cursor_time(conn: i32) {
+    let mut lock = LATEST_PEER_INPUT_CURSOR.lock().unwrap();
+    lock.conn = conn;
+    lock.time = get_time();
+}
+
 #[inline]
 fn get_last_input_cursor_pos() -> (i32, i32) {
     let lock = LATEST_PEER_INPUT_CURSOR.lock().unwrap();
     (lock.x, lock.y)
 }
 
+// check if mouse is moved by the controlled side user to make controlled side has higher mouse priority than remote.
 fn active_mouse_(conn: i32) -> bool {
+    true
+    /* this method is buggy (not working on macOS, making fast moving mouse event discarded here) and added latency (this is blocking way, must do in async way), so we disable it for now
     // out of time protection
     if LATEST_SYS_CURSOR_POS.lock().unwrap().0.elapsed() > MOUSE_MOVE_PROTECTION_TIMEOUT {
         return true;
@@ -748,10 +809,35 @@ fn active_mouse_(conn: i32) -> bool {
         }
         None => true,
     }
+    */
 }
 
-// _conn is used by `update_latest_peer_input_cursor`, which is only enabled on "not Win".
-pub fn handle_mouse_(evt: &MouseEvent, _conn: i32) {
+pub fn handle_pointer_(evt: &PointerDeviceEvent, conn: i32) {
+    if !active_mouse_(conn) {
+        return;
+    }
+
+    if EXITING.load(Ordering::SeqCst) {
+        return;
+    }
+
+    match &evt.union {
+        Some(TouchEvent(evt)) => match &evt.union {
+            Some(ScaleUpdate(_scale_evt)) => {
+                #[cfg(target_os = "windows")]
+                handle_scale(_scale_evt.scale);
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
+pub fn handle_mouse_(evt: &MouseEvent, conn: i32) {
+    if !active_mouse_(conn) {
+        return;
+    }
+
     if EXITING.load(Ordering::SeqCst) {
         return;
     }
@@ -763,7 +849,7 @@ pub fn handle_mouse_(evt: &MouseEvent, _conn: i32) {
     let mut en = ENIGO.lock().unwrap();
     #[cfg(not(target_os = "macos"))]
     let mut to_release = Vec::new();
-    if evt_type == 1 {
+    if evt_type == MOUSE_TYPE_DOWN {
         fix_modifiers(&evt.modifiers[..], &mut en, 0);
         #[cfg(target_os = "macos")]
         en.reset_flag();
@@ -784,48 +870,52 @@ pub fn handle_mouse_(evt: &MouseEvent, _conn: i32) {
         }
     }
     match evt_type {
-        0 => {
+        MOUSE_TYPE_MOVE => {
             en.mouse_move_to(evt.x, evt.y);
-            #[cfg(not(windows))]
-            update_latest_peer_input_cursor(evt, _conn, true);
+            *LATEST_PEER_INPUT_CURSOR.lock().unwrap() = Input {
+                conn,
+                time: get_time(),
+                x: evt.x,
+                y: evt.y,
+            };
         }
-        1 => match buttons {
-            0x01 => {
+        MOUSE_TYPE_DOWN => match buttons {
+            MOUSE_BUTTON_LEFT => {
                 allow_err!(en.mouse_down(MouseButton::Left));
             }
-            0x02 => {
+            MOUSE_BUTTON_RIGHT => {
                 allow_err!(en.mouse_down(MouseButton::Right));
             }
-            0x04 => {
+            MOUSE_BUTTON_WHEEL => {
                 allow_err!(en.mouse_down(MouseButton::Middle));
             }
-            0x08 => {
+            MOUSE_BUTTON_BACK => {
                 allow_err!(en.mouse_down(MouseButton::Back));
             }
-            0x10 => {
+            MOUSE_BUTTON_FORWARD => {
                 allow_err!(en.mouse_down(MouseButton::Forward));
             }
             _ => {}
         },
-        2 => match buttons {
-            0x01 => {
+        MOUSE_TYPE_UP => match buttons {
+            MOUSE_BUTTON_LEFT => {
                 en.mouse_up(MouseButton::Left);
             }
-            0x02 => {
+            MOUSE_BUTTON_RIGHT => {
                 en.mouse_up(MouseButton::Right);
             }
-            0x04 => {
+            MOUSE_BUTTON_WHEEL => {
                 en.mouse_up(MouseButton::Middle);
             }
-            0x08 => {
+            MOUSE_BUTTON_BACK => {
                 en.mouse_up(MouseButton::Back);
             }
-            0x10 => {
+            MOUSE_BUTTON_FORWARD => {
                 en.mouse_up(MouseButton::Forward);
             }
             _ => {}
         },
-        3 | 4 => {
+        MOUSE_TYPE_WHEEL | MOUSE_TYPE_TRACKPAD => {
             #[allow(unused_mut)]
             let mut x = evt.x;
             #[allow(unused_mut)]
@@ -835,12 +925,13 @@ pub fn handle_mouse_(evt: &MouseEvent, _conn: i32) {
                 x = -x;
                 y = -y;
             }
+
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            let is_track_pad = evt_type == MOUSE_TYPE_TRACKPAD;
+
             #[cfg(target_os = "macos")]
             {
                 // TODO: support track pad on win.
-                let is_track_pad = evt
-                    .modifiers
-                    .contains(&EnumOrUnknown::new(ControlKey::Scroll));
 
                 // fix shift + scroll(down/up)
                 if !is_track_pad
@@ -860,13 +951,19 @@ pub fn handle_mouse_(evt: &MouseEvent, _conn: i32) {
                 }
             }
 
+            #[cfg(windows)]
+            if !is_track_pad {
+                x *= WHEEL_DELTA as i32;
+                y *= WHEEL_DELTA as i32;
+            }
+
             #[cfg(not(target_os = "macos"))]
             {
-                if x != 0 {
-                    en.mouse_scroll_x(x);
-                }
                 if y != 0 {
                     en.mouse_scroll_y(y);
+                }
+                if x != 0 {
+                    en.mouse_scroll_x(x);
                 }
             }
         }
@@ -875,6 +972,18 @@ pub fn handle_mouse_(evt: &MouseEvent, _conn: i32) {
     #[cfg(not(target_os = "macos"))]
     for key in to_release {
         en.key_up(key.clone());
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn handle_scale(scale: i32) {
+    let mut en = ENIGO.lock().unwrap();
+    if scale == 0 {
+        en.key_up(Key::Control);
+    } else {
+        if en.key_down(Key::Control).is_ok() {
+            en.mouse_scroll_y(scale);
+        }
     }
 }
 
@@ -925,7 +1034,6 @@ pub async fn lock_screen() {
     crate::platform::lock_screen();
     }
     }
-    super::video_service::switch_to_primary().await;
 }
 
 pub fn handle_key(evt: &KeyEvent) {
@@ -1065,7 +1173,7 @@ fn map_keyboard_mode(evt: &KeyEvent) {
 
     // Wayland
     #[cfg(target_os = "linux")]
-    if !*IS_X11 {
+    if !crate::platform::linux::is_x11() {
         let mut en = ENIGO.lock().unwrap();
         let code = evt.chr() as u16;
 
@@ -1438,11 +1546,11 @@ pub fn handle_key_(evt: &KeyEvent) {
         _ => {}
     };
 
-    match evt.mode.unwrap() {
-        KeyboardMode::Map => {
+    match evt.mode.enum_value() {
+        Ok(KeyboardMode::Map) => {
             map_keyboard_mode(evt);
         }
-        KeyboardMode::Translate => {
+        Ok(KeyboardMode::Translate) => {
             translate_keyboard_mode(evt);
         }
         _ => {
